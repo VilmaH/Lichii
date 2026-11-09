@@ -143,4 +143,10 @@ public:
     friend class A64EmitX64;
 };
 
+// Rounds x to an integral value with ties away from zero (FRINTA/FCVTA*). Requires SSE4.1, and SSE4.2 for fsize 64.
+// result must differ from x. Only the lowest element is valid when !packed. Clobbers xmm0.
+void EmitFPRoundTieAway(BlockOfCode& code, size_t fsize, bool packed, Xbyak::Xmm result, Xbyak::Xmm x, Xbyak::Xmm tmp, bool raise_inexact);
+// Sets FPSR.IDC if fpcr.FZ is set and x (any element when packed) is denormal. Same requirements as above.
+void EmitFPCheckInputDenormal(BlockOfCode& code, EmitContext& ctx, FP::FPCR fpcr, size_t fsize, bool packed, Xbyak::Xmm x, Xbyak::Xmm tmp);
+
 }  // namespace Dynarmic::Backend::X64

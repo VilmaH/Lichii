@@ -149,6 +149,53 @@ std::vector<FPT> FloatInputs(size_t random_count) {
     return v;
 }
 
+// FPToFixed from the Arm pseudocode for fbits = 0 and ties away from zero.
+template<typename FPT>
+std::pair<u64, u32> ReferenceToFixed(FPT x, size_t isize, bool unsigned_, u32 fpcr_value) {
+    using F = FloatOf<FPT>;
+    const F f = std::bit_cast<F>(x);
+    if (std::isnan(f)) {
+        return {0, FPSR_IOC};
+    }
+    if (std::fpclassify(f) == FP_SUBNORMAL && (fpcr_value & FPCR_FZ)) {
+        return {0, FPSR_IDC};
+    }
+    const double value = double(f);
+    const double rounded = std::round(value);  // ties away from zero, exact
+    const double lower = unsigned_ ? 0.0 : -std::ldexp(1.0, int(isize) - 1);
+    const double upper = std::ldexp(1.0, int(isize) - (unsigned_ ? 0 : 1));
+    const u64 mask = isize == 64 ? ~u64(0) : (u64(1) << isize) - 1;
+    if (rounded < lower) {
+        return {u64(s64(lower)) & mask, FPSR_IOC};
+    }
+    if (rounded >= upper) {
+        return {unsigned_ ? mask : mask >> 1, FPSR_IOC};
+    }
+    const u64 result = unsigned_ ? u64(rounded) : u64(s64(rounded));
+    return {result & mask, rounded != value ? FPSR_IXC : 0};
+}
+
+// FP::FPToFixed (the C++ fallback) differs from the Arm pseudocode for unsigned conversions of
+// -0.5 < x < 0 (IOC instead of IXC) and for negative inputs whose floor is the minimum but which
+// round up to a valid value (e.g. -2147483647.25 to W). Everything else must agree with the oracle above.
+template<typename FPT>
+bool FallbackKnownDifference(FPT x, size_t isize, bool unsigned_) {
+    using F = FloatOf<FPT>;
+    const double value = double(std::bit_cast<F>(x));
+    if (unsigned_) {
+        return value < 0 && value > -0.5;
+    }
+    const double min = -std::ldexp(1.0, int(isize) - 1);
+    return value < min + 1 && value > min - 0.5;
+}
+
+template<typename FPT>
+std::pair<u64, u32> ReferenceRoundTieAway(FPT x, u32 fpcr_value) {
+    FP::FPSR fpsr{};
+    const u64 result = FP::FPRoundInt<FPT>(x, FP::FPCR{fpcr_value}, FP::RoundingMode::ToNearest_TieAwayFromZero, false, fpsr);
+    return {result, fpsr.Value()};
+}
+
 // Counts mismatches and stops reporting after a few.
 struct Mismatches {
     size_t count = 0;
@@ -159,6 +206,69 @@ struct Mismatches {
     }
     ~Mismatches() { CHECK(count == 0); }
 };
+
+enum class Dest { X0, V0 };
+
+// Scalar FCVTAS/FCVTAU
+template<typename FPT>
+void CheckScalarToFixed(u32 instruction, const char* name, size_t isize, bool unsigned_, Dest dest) {
+    Runner runner{instruction};
+    Mismatches mismatches;
+    const u64 mask = isize == 64 ? ~u64(0) : (u64(1) << isize) - 1;
+    for (const u32 fpcr : fpcr_values) {
+        for (const FPT x : FloatInputs<FPT>(3000)) {
+            runner.Run(fpcr, {x, 0x5555555555555555});
+            const auto [expected, expected_fpsr] = ReferenceToFixed<FPT>(x, isize, unsigned_, fpcr);
+            const u64 got = dest == Dest::X0 ? runner.X0() : runner.V0()[0];
+            const bool upper_ok = dest == Dest::X0 ? (got & ~mask) == 0 : runner.V0()[1] == 0 && (got & ~mask) == 0;
+            if ((got & mask) != expected || !upper_ok || runner.Fpsr() != expected_fpsr) {
+                mismatches.Report(std::string(name) + " fpcr=" + Hex(fpcr) + " x=" + Hex(x) + " got=" + Hex(got) + " fpsr=" + Hex(runner.Fpsr())
+                                  + " expected=" + Hex(expected) + " fpsr=" + Hex(expected_fpsr));
+            }
+        }
+    }
+}
+
+// Vector FCVTAS/FCVTAU (ToFixed) and FRINTA (RoundInt). Each input is checked alone and in groups.
+template<typename FPT, bool round_int>
+void CheckVector(u32 instruction, const char* name, bool unsigned_, bool q) {
+    constexpr size_t lanes = 16 / sizeof(FPT);
+    const size_t active = q ? lanes : lanes / 2;
+    Runner runner{instruction};
+    Mismatches mismatches;
+    const auto inputs = FloatInputs<FPT>(4000);
+    std::mt19937_64 rng(42);
+
+    for (const u32 fpcr : fpcr_values) {
+        for (size_t i = 0; i < inputs.size() * 2; i++) {
+            std::array<FPT, lanes> in{};
+            if (i < inputs.size()) {
+                in[i % active] = inputs[i];
+            } else {
+                for (size_t j = 0; j < active; j++) {
+                    in[j] = inputs[rng() % inputs.size()];
+                }
+            }
+            std::array<FPT, lanes> expected{};
+            u32 expected_fpsr = 0;
+            for (size_t j = 0; j < active; j++) {
+                const auto [r, f] = round_int ? ReferenceRoundTieAway<FPT>(in[j], fpcr) : ReferenceToFixed<FPT>(in[j], sizeof(FPT) * 8, unsigned_, fpcr);
+                expected[j] = FPT(r);
+                expected_fpsr |= f;
+            }
+            Vector v1;
+            std::memcpy(&v1, in.data(), 16);
+            runner.Run(fpcr, v1);
+            const Vector got = runner.V0();
+            if (std::memcmp(&got, expected.data(), 16) != 0 || runner.Fpsr() != expected_fpsr) {
+                Vector exp;
+                std::memcpy(&exp, expected.data(), 16);
+                mismatches.Report(std::string(name) + " fpcr=" + Hex(fpcr) + " x=" + Hex(v1[1]) + Hex(v1[0]) + " got=" + Hex(got[1]) + Hex(got[0]) + " fpsr=" + Hex(runner.Fpsr())
+                                  + " expected=" + Hex(exp[1]) + Hex(exp[0]) + " fpsr=" + Hex(expected_fpsr));
+            }
+        }
+    }
+}
 
 template<typename FPT>
 void CheckScalarRoundInt(u32 instruction, const char* name, FP::RoundingMode rounding, bool exact, const std::vector<FPT>& inputs) {
@@ -228,5 +338,93 @@ TEST_CASE("A64: FRINT scalar vs FPRoundInt", "[a64][fp_inline]") {
     CheckScalarRoundInt<u64>(0x1E664020, "FRINTA D0, D1", FP::RoundingMode::ToNearest_TieAwayFromZero, false, FloatInputs<u64>(4000));
     CheckScalarRoundInt<u32>(0x1E274020, "FRINTX S0, S1", FP::RoundingMode::ToNearest_TieEven, true, FloatInputs<u32>(1000));
     CheckScalarRoundInt<u64>(0x1E674020, "FRINTX D0, D1", FP::RoundingMode::ToNearest_TieEven, true, FloatInputs<u64>(1000));
+}
+
+TEST_CASE("A64: FCVTAS/FCVTAU directed", "[a64][fp_inline]") {
+    struct Case {
+        u32 instruction;
+        u64 input;
+        u64 expected;
+        u32 fpsr;
+    };
+    const std::vector<Case> cases{
+        {0x1E240020, 0x40200000, 3, FPSR_IXC},                      // FCVTAS W0, S1: 2.5 -> 3
+        {0x1E240020, 0xC0200000, 0xFFFFFFFD, FPSR_IXC},             // FCVTAS W0, S1: -2.5 -> -3
+        {0x1E240020, 0xBF000000, 0xFFFFFFFF, FPSR_IXC},             // FCVTAS W0, S1: -0.5 -> -1
+        {0x1E240020, 0x4AFFFFFF, 0x800000, FPSR_IXC},               // FCVTAS W0, S1: 8388607.5 -> 8388608
+        {0x1E240020, 0x4F000000, 0x7FFFFFFF, FPSR_IOC},             // FCVTAS W0, S1: 2^31 saturates
+        {0x1E240020, 0xCF000000, 0x80000000, 0},                    // FCVTAS W0, S1: -2^31
+        {0x1E240020, 0x7FC00000, 0, FPSR_IOC},                      // FCVTAS W0, S1: NaN
+        {0x9E640020, 0xC32FFFFFFFFFFFFF, 0xFFF0000000000000, FPSR_IXC},  // FCVTAS X0, D1: -(2^52 - 0.5)
+        {0x1E640020, 0x41DFFFFFFFE00000, 0x7FFFFFFF, FPSR_IOC},     // FCVTAS W0, D1: 2147483647.5 rounds to 2^31 and saturates
+        {0x1E640020, 0x41DFFFFFFFD00000, 0x7FFFFFFF, FPSR_IXC},     // FCVTAS W0, D1: 2147483647.25 -> 2147483647
+        {0x1E250020, 0xBF000000, 0, FPSR_IOC},                      // FCVTAU W0, S1: -0.5 -> -1 saturates
+        {0x1E250020, 0xBE800000, 0, FPSR_IXC},                      // FCVTAU W0, S1: -0.25 -> 0
+        {0x1E250020, 0x4F800000, 0xFFFFFFFF, FPSR_IOC},             // FCVTAU W0, S1: 2^32 saturates
+        {0x9E650020, 0x43EFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF800, 0},    // FCVTAU X0, D1: largest double below 2^64
+    };
+    for (const Case& c : cases) {
+        const bool is_w = (c.instruction >> 31) == 0;
+        const bool is_s = ((c.instruction >> 22) & 3) == 0;
+        Runner runner{c.instruction};
+        runner.Run(0, {c.input, 0});
+        INFO("instruction " << Hex(c.instruction) << " input " << Hex(c.input));
+        const auto [ref, ref_fpsr] = is_s ? ReferenceToFixed<u32>(u32(c.input), is_w ? 32 : 64, ((c.instruction >> 16) & 1) != 0, 0)
+                                          : ReferenceToFixed<u64>(c.input, is_w ? 32 : 64, ((c.instruction >> 16) & 1) != 0, 0);
+        CHECK(ref == c.expected);
+        CHECK(ref_fpsr == c.fpsr);
+        CHECK(runner.X0() == c.expected);
+        CHECK(runner.Fpsr() == c.fpsr);
+    }
+}
+
+TEST_CASE("FPToFixed tie-away vs Arm pseudocode", "[fp][fp_inline]") {
+    Mismatches mismatches;
+    const auto check = [&](auto x, size_t isize, bool unsigned_, u32 fpcr) {
+        using FPT = decltype(x);
+        FP::FPSR fpsr{};
+        const u64 fallback = FP::FPToFixed<FPT>(isize, x, 0, unsigned_, FP::FPCR{fpcr}, FP::RoundingMode::ToNearest_TieAwayFromZero, fpsr);
+        const auto [expected, expected_fpsr] = ReferenceToFixed<FPT>(x, isize, unsigned_, fpcr);
+        if ((fallback != expected || fpsr.Value() != expected_fpsr) && !FallbackKnownDifference<FPT>(x, isize, unsigned_)) {
+            mismatches.Report("isize=" + std::to_string(isize) + " unsigned=" + std::to_string(unsigned_) + " x=" + Hex(x) + " fallback=" + Hex(fallback) + " fpsr=" + Hex(fpsr.Value())
+                              + " expected=" + Hex(expected) + " fpsr=" + Hex(expected_fpsr));
+        }
+    };
+    for (const u32 fpcr : {u32(0), FPCR_FZ}) {
+        for (const size_t isize : {32, 64}) {
+            for (const bool unsigned_ : {false, true}) {
+                for (const u32 x : FloatInputs<u32>(3000)) {
+                    check(x, isize, unsigned_, fpcr);
+                }
+                for (const u64 x : FloatInputs<u64>(3000)) {
+                    check(x, isize, unsigned_, fpcr);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("A64: FCVTAS/FCVTAU scalar", "[a64][fp_inline]") {
+    CheckScalarToFixed<u32>(0x1E240020, "FCVTAS W0, S1", 32, false, Dest::X0);
+    CheckScalarToFixed<u32>(0x9E240020, "FCVTAS X0, S1", 64, false, Dest::X0);
+    CheckScalarToFixed<u64>(0x1E640020, "FCVTAS W0, D1", 32, false, Dest::X0);
+    CheckScalarToFixed<u64>(0x9E640020, "FCVTAS X0, D1", 64, false, Dest::X0);
+    CheckScalarToFixed<u32>(0x1E250020, "FCVTAU W0, S1", 32, true, Dest::X0);
+    CheckScalarToFixed<u32>(0x9E250020, "FCVTAU X0, S1", 64, true, Dest::X0);
+    CheckScalarToFixed<u64>(0x1E650020, "FCVTAU W0, D1", 32, true, Dest::X0);
+    CheckScalarToFixed<u64>(0x9E650020, "FCVTAU X0, D1", 64, true, Dest::X0);
+    CheckScalarToFixed<u32>(0x5E21C820, "FCVTAS S0, S1", 32, false, Dest::V0);
+    CheckScalarToFixed<u64>(0x5E61C820, "FCVTAS D0, D1", 64, false, Dest::V0);
+    CheckScalarToFixed<u32>(0x7E21C820, "FCVTAU S0, S1", 32, true, Dest::V0);
+    CheckScalarToFixed<u64>(0x7E61C820, "FCVTAU D0, D1", 64, true, Dest::V0);
+}
+
+TEST_CASE("A64: FCVTAS/FCVTAU vector", "[a64][fp_inline]") {
+    CheckVector<u32, false>(0x4E21C820, "FCVTAS V0.4S, V1.4S", false, true);
+    CheckVector<u32, false>(0x0E21C820, "FCVTAS V0.2S, V1.2S", false, false);
+    CheckVector<u64, false>(0x4E61C820, "FCVTAS V0.2D, V1.2D", false, true);
+    CheckVector<u32, false>(0x6E21C820, "FCVTAU V0.4S, V1.4S", true, true);
+    CheckVector<u32, false>(0x2E21C820, "FCVTAU V0.2S, V1.2S", true, false);
+    CheckVector<u64, false>(0x6E61C820, "FCVTAU V0.2D, V1.2D", true, true);
 }
 

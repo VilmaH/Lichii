@@ -334,6 +334,98 @@ void FPThreeOp(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, Function fn)
 
 }  // anonymous namespace
 
+void EmitFPRoundTieAway(BlockOfCode& code, size_t fsize, bool packed, Xbyak::Xmm result, Xbyak::Xmm x, Xbyak::Xmm tmp, bool raise_inexact) {
+    ASSERT(fsize == 32 || fsize == 64);
+    ASSERT(result.getIdx() != x.getIdx() && result.getIdx() != tmp.getIdx() && x.getIdx() != tmp.getIdx());
+    const auto bcast = [&](u64 value) {
+        return fsize == 32 ? code.Const(xword, value | (value << 32), value | (value << 32)) : code.Const(xword, value, value);
+    };
+    const u64 non_sign_mask = fsize == 32 ? f32_non_sign_mask : f64_non_sign_mask;
+    const u64 sign_mask = fsize == 32 ? f32_negative_zero : f64_negative_zero;
+    const u64 integral_limit = fsize == 32 ? 0x4B000000 : 0x4330000000000000;  // 2^23 / 2^52
+    const u64 half = fsize == 32 ? 0x3F000000 : 0x3FE0000000000000;
+    const u64 one = fsize == 32 ? 0x3F800000 : 0x3FF0000000000000;
+    const u8 trunc_imm = raise_inexact ? 0b0011 : 0b1011;
+
+    // t = trunc(x). This also quiets NaNs and raises IE for SNaNs.
+    if (packed) {
+        fsize == 32 ? code.roundps(result, x, trunc_imm) : code.roundpd(result, x, trunc_imm);
+    } else {
+        code.movaps(result, x);
+        fsize == 32 ? code.roundss(result, x, trunc_imm) : code.roundsd(result, x, trunc_imm);
+    }
+
+    // Only |x| < 2^23 (2^52) can have a fraction. Integer compare, so no FP exceptions for NaN/inf.
+    code.movaps(tmp, x);
+    code.andps(tmp, bcast(non_sign_mask));
+    code.movaps(xmm0, bcast(integral_limit));
+    fsize == 32 ? code.pcmpgtd(xmm0, tmp) : code.pcmpgtq(xmm0, tmp);
+
+    // |x - t| on those elements, zero elsewhere; exact
+    code.movaps(tmp, x);
+    code.andps(tmp, xmm0);
+    code.andps(xmm0, result);
+    if (fsize == 32) {
+        packed ? code.subps(tmp, xmm0) : code.subss(tmp, xmm0);
+    } else {
+        packed ? code.subpd(tmp, xmm0) : code.subsd(tmp, xmm0);
+    }
+    code.andps(tmp, bcast(non_sign_mask));
+
+    // t += copysign(|x - t| >= 0.5 ? 1 : 0, x). Adding a zero of the same sign keeps -0 for x in (-0.5, -0].
+    if (fsize == 32) {
+        packed ? code.cmpnltps(tmp, bcast(half)) : code.cmpnltss(tmp, bcast(half));
+    } else {
+        packed ? code.cmpnltpd(tmp, bcast(half)) : code.cmpnltsd(tmp, bcast(half));
+    }
+    code.andps(tmp, bcast(one));
+    code.movaps(xmm0, x);
+    code.andps(xmm0, bcast(sign_mask));
+    code.orps(tmp, xmm0);
+    if (fsize == 32) {
+        packed ? code.addps(result, tmp) : code.addss(result, tmp);
+    } else {
+        packed ? code.addpd(result, tmp) : code.addsd(result, tmp);
+    }
+}
+
+void EmitFPCheckInputDenormal(BlockOfCode& code, EmitContext& ctx, FP::FPCR fpcr, size_t fsize, bool packed, Xbyak::Xmm x, Xbyak::Xmm tmp) {
+    if (!fpcr.FZ()) {
+        return;
+    }
+    ASSERT(fsize == 32 || fsize == 64);
+    const auto bcast = [&](u64 value) {
+        return fsize == 32 ? code.Const(xword, value | (value << 32), value | (value << 32)) : code.Const(xword, value, value);
+    };
+
+    // 0 < |x| < smallest normal
+    code.movaps(tmp, x);
+    code.andps(tmp, bcast(fsize == 32 ? f32_non_sign_mask : f64_non_sign_mask));
+    code.movaps(xmm0, bcast(fsize == 32 ? f32_smallest_normal : f64_smallest_normal));
+    if (fsize == 32) {
+        code.pcmpgtd(xmm0, tmp);
+        code.pcmpgtd(tmp, code.Const(xword, 0, 0));
+    } else {
+        code.pcmpgtq(xmm0, tmp);
+        code.pcmpgtq(tmp, code.Const(xword, 0, 0));
+    }
+    code.pand(xmm0, tmp);
+    if (packed) {
+        code.ptest(xmm0, xmm0);
+    } else {
+        code.ptest(xmm0, code.Const(xword, fsize == 32 ? 0xFFFFFFFF : ~u64(0), 0));
+    }
+
+    SharedLabel denormal = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+    code.jnz(*denormal, code.T_NEAR);
+    code.L(*end);
+    ctx.deferred_emits.emplace_back([=, &code] {
+        code.L(*denormal);
+        code.or_(code.dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_fpsr_exc], u32(1) << 7);  // FPSR.IDC
+        code.jmp(*end, code.T_NEAR);
+    });
+}
+
 template<size_t fsize>
 void FPAbs(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     using FPT = mcl::unsigned_integer_of_size<fsize>;
@@ -1598,12 +1690,106 @@ static u64 EmitFPToFixedThunk(u64 input, FP::FPSR& fpsr, FP::FPCR fpcr, u32 extr
     return FP::FPToFixed<FPT>(isize, FPT(input), fbits, unsigned_, fpcr, rounding, fpsr);
 }
 
+// FCVTA*: round to nearest with ties away, then saturate. IOC, IXC and IDC are set as FPToFixed does.
+template<size_t fsize, bool unsigned_, size_t isize>
+static void EmitFPToFixedTieAway(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, RegAlloc::ArgumentInfo& args) {
+    static_assert(fsize == 32 || fsize == 64);
+    static_assert(isize == 32 || isize == 64);
+    const Xbyak::Xmm x = ctx.reg_alloc.UseXmm(code, args[0]);
+    const Xbyak::Xmm r = ctx.reg_alloc.ScratchXmm(code);
+    const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
+    const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code).cvt64();
+
+    // Inputs that saturate are integral (or NaN), except negative inputs of unsigned conversions
+    // and doubles converted to 32 bits. Those must not set IXC, so it is raised separately for in-range inputs.
+    constexpr bool separate_inexact = unsigned_ || (fsize == 64 && isize == 32);
+
+    EmitFPCheckInputDenormal(code, ctx, ctx.FPCR(), fsize, false, x, tmp);
+    EmitFPRoundTieAway(code, fsize, false, r, x, tmp, !separate_inexact);
+    if constexpr (fsize == 32) {
+        code.cvtss2sd(r, r);
+    }
+
+    constexpr u64 upper_limit = unsigned_ ? (isize == 64 ? 0x43F0000000000000 : 0x41F0000000000000)   // 2^64 / 2^32
+                                          : (isize == 64 ? 0x43E0000000000000 : 0x41E0000000000000);  // 2^63 / 2^31
+    constexpr u64 max_value = unsigned_ ? (isize == 64 ? ~u64(0) : 0xFFFFFFFF)
+                                        : (isize == 64 ? 0x7FFFFFFFFFFFFFFF : 0x7FFFFFFF);
+
+    // Unsigned conversions saturate negative results to 0. Signed double to 32-bit conversions check
+    // the lower limit here so the inexact check below does not run for them.
+    constexpr bool check_min = unsigned_ || separate_inexact;
+    SharedLabel end = ctx.GenSharedLabel(), saturate_max = ctx.GenSharedLabel(), saturate_min = ctx.GenSharedLabel(), nan = ctx.GenSharedLabel();
+    SharedLabel big = unsigned_ && isize == 64 ? ctx.GenSharedLabel() : nullptr;
+
+    code.comisd(r, code.Const(xword, upper_limit));  // Signals IE for NaN
+    code.jae(*saturate_max, code.T_NEAR);
+    code.jp(*nan, code.T_NEAR);
+    if constexpr (unsigned_) {
+        code.xorps(tmp, tmp);
+        code.comisd(r, tmp);
+        code.jb(*saturate_min, code.T_NEAR);
+    } else if constexpr (check_min) {
+        code.comisd(r, code.Const(xword, 0xC1E0000000000000));  // -2^31
+        code.jb(*saturate_min, code.T_NEAR);
+    }
+    if constexpr (separate_inexact) {
+        fsize == 32 ? code.roundss(tmp, x, 0b0000) : code.roundsd(tmp, x, 0b0000);
+    }
+    if constexpr (unsigned_ && isize == 64) {
+        code.comisd(r, code.Const(xword, f64_max_s64_lim));
+        code.jae(*big, code.T_NEAR);
+    }
+    if constexpr (isize == 64 || unsigned_) {
+        code.cvttsd2si(result, r);
+    } else {
+        code.cvttsd2si(result.cvt32(), r);  // Values below INT32_MIN give INT32_MIN and IE
+    }
+    code.L(*end);
+
+    ctx.deferred_emits.emplace_back([=, &code] {
+        const auto set_ioc = [&] {
+            code.or_(code.dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_fpsr_exc], 1);  // FPSR.IOC
+        };
+        code.L(*saturate_max);
+        code.mov(result, max_value);
+        set_ioc();
+        code.jmp(*end, code.T_NEAR);
+        code.L(*nan);
+        code.xor_(result.cvt32(), result.cvt32());
+        code.jmp(*end, code.T_NEAR);
+        if constexpr (check_min) {
+            code.L(*saturate_min);
+            code.mov(result.cvt32(), unsigned_ ? 0 : 0x80000000);
+            set_ioc();
+            code.jmp(*end, code.T_NEAR);
+        }
+        if constexpr (unsigned_ && isize == 64) {
+            code.L(*big);
+            code.movaps(tmp, r);
+            code.subsd(tmp, code.Const(xword, f64_max_s64_lim));
+            code.cvttsd2si(result, tmp);
+            code.btc(result, 63);
+            code.jmp(*end, code.T_NEAR);
+        }
+    });
+
+    ctx.reg_alloc.DefineValue(code, inst, result);
+}
+
 template<size_t fsize, bool unsigned_, size_t isize>
 static void EmitFPToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
     const size_t fbits = args[1].GetImmediateU8();
     const auto rounding_mode = FP::RoundingMode(args[2].GetImmediateU8());
+
+    if constexpr (fsize != 16 && isize != 16) {
+        if (rounding_mode == FP::RoundingMode::ToNearest_TieAwayFromZero && fbits == 0
+            && code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
+            EmitFPToFixedTieAway<fsize, unsigned_, isize>(code, ctx, inst, args);
+            return;
+        }
+    }
 
     if constexpr (fsize != 16) {
         const auto round_imm = ConvertRoundingModeToX64Immediate(rounding_mode);
