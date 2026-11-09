@@ -1656,6 +1656,16 @@ void EmitFPVectorRoundInt(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     const bool exact = inst->GetArg(2).GetU1();
 
     if constexpr (fsize != 16) {
+        if (rounding == FP::RoundingMode::ToNearest_TieAwayFromZero && !exact
+            && code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
+            const bool fpcr_controlled = inst->GetArg(3).GetU1();
+            EmitTwoOpVectorOperation<fsize, DefaultIndexer, 3>(code, ctx, inst, [&](const Xbyak::Xmm& result, const Xbyak::Xmm& xmm_a) {
+                const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
+                EmitFPCheckInputDenormal(code, ctx, ctx.FPCR(fpcr_controlled), fsize, true, xmm_a, tmp);
+                EmitFPRoundTieAway(code, fsize, true, result, xmm_a, tmp, false);
+            });
+            return;
+        }
         if (code.HasHostFeature(HostFeature::SSE41) && rounding != FP::RoundingMode::ToNearest_TieAwayFromZero && !exact) {
             const auto round_imm = ConvertRoundingModeToX64Immediate(rounding);
             EmitTwoOpVectorOperation<fsize, DefaultIndexer, 3>(code, ctx, inst, [&](const Xbyak::Xmm& result, const Xbyak::Xmm& xmm_a) {
@@ -1988,7 +1998,9 @@ void EmitFPVectorToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     const auto rounding = FP::RoundingMode(inst->GetArg(2).GetU8());
     [[maybe_unused]] const bool fpcr_controlled = inst->GetArg(3).GetU1();
 
-    if (code.HasHostFeature(HostFeature::SSE41) && fsize != 16 && rounding != FP::RoundingMode::ToNearest_TieAwayFromZero) {
+    const bool tie_away = rounding == FP::RoundingMode::ToNearest_TieAwayFromZero;
+    if (code.HasHostFeature(HostFeature::SSE41) && fsize != 16
+        && (!tie_away || (fbits == 0 && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))))) {
         auto args = ctx.reg_alloc.GetArgumentInfo(inst);
         const Xbyak::Xmm src = ctx.reg_alloc.UseScratchXmm(code, args[0]);
         MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
@@ -2024,7 +2036,34 @@ void EmitFPVectorToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
                 FCODE(mulp)(src, GetVectorOf<fsize>(code, scale_factor));
             }
 
-            FCODE(roundp)(src, src, u8(*round_imm));
+            if (tie_away) {
+                const Xbyak::Xmm x = ctx.reg_alloc.ScratchXmm(code);
+                const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
+                code.movaps(x, src);
+                EmitFPCheckInputDenormal(code, ctx, ctx.FPCR(fpcr_controlled), fsize, true, x, tmp);
+                // Elements that saturate are integral or NaN, except negative ones of unsigned conversions.
+                EmitFPRoundTieAway(code, fsize, true, src, x, tmp, !unsigned_);
+                // The conversion below zeroes NaNs quietly, but they must set IOC: the signaling compares raise IE for them.
+                code.movaps(tmp, src);
+                if constexpr (!unsigned_) {
+                    FCODE(cmpltp)(tmp, tmp);
+                } else {
+                    // Results of -1 or less saturate to 0 quietly below. Raise IE by converting their all-ones (NaN) mask.
+                    FCODE(cmpltp)(tmp, GetVectorOf<fsize, 0>(code));
+                    fsize == 32 ? code.cvttps2dq(xmm0, tmp) : code.cvttpd2dq(xmm0, tmp);
+                    // IXC only from the elements that do not saturate
+                    code.andnps(tmp, x);
+                    FCODE(roundp)(tmp, tmp, u8(0b0000));
+                    // Clamp to 2^32 (2^64) so the subtraction below cannot raise PE. minp keeps NaNs from src.
+                    code.movaps(tmp, GetVectorOf<fsize, (fsize == 32 ? 0x4f800000 : 0x43f0000000000000)>(code));
+                    FCODE(minp)(tmp, src);
+                    code.movaps(src, tmp);
+                }
+                ctx.reg_alloc.Release(x);
+                ctx.reg_alloc.Release(tmp);
+            } else {
+                FCODE(roundp)(src, src, u8(*round_imm));
+            }
             const Xbyak::Xmm nan_mask = xmm0;
             if (code.HasHostFeature(HostFeature::AVX512_OrthoFloat)) {
                 static constexpr u32 nan_to_zero = FixupLUT(FpFixup::PosZero, FpFixup::PosZero);
