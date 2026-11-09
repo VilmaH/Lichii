@@ -340,6 +340,12 @@ TEST_CASE("A64: FRINT scalar vs FPRoundInt", "[a64][fp_inline]") {
     CheckScalarRoundInt<u64>(0x1E674020, "FRINTX D0, D1", FP::RoundingMode::ToNearest_TieEven, true, FloatInputs<u64>(1000));
 }
 
+TEST_CASE("A64: FRINTA vector", "[a64][fp_inline]") {
+    CheckVector<u32, true>(0x6E218820, "FRINTA V0.4S, V1.4S", false, true);
+    CheckVector<u32, true>(0x2E218820, "FRINTA V0.2S, V1.2S", false, false);
+    CheckVector<u64, true>(0x6E618820, "FRINTA V0.2D, V1.2D", false, true);
+}
+
 TEST_CASE("A64: FCVTAS/FCVTAU directed", "[a64][fp_inline]") {
     struct Case {
         u32 instruction;

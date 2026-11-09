@@ -1656,6 +1656,16 @@ void EmitFPVectorRoundInt(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     const bool exact = inst->GetArg(2).GetU1();
 
     if constexpr (fsize != 16) {
+        if (rounding == FP::RoundingMode::ToNearest_TieAwayFromZero && !exact
+            && code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
+            const bool fpcr_controlled = inst->GetArg(3).GetU1();
+            EmitTwoOpVectorOperation<fsize, DefaultIndexer, 3>(code, ctx, inst, [&](const Xbyak::Xmm& result, const Xbyak::Xmm& xmm_a) {
+                const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
+                EmitFPCheckInputDenormal(code, ctx, ctx.FPCR(fpcr_controlled), fsize, true, xmm_a, tmp);
+                EmitFPRoundTieAway(code, fsize, true, result, xmm_a, tmp, false);
+            });
+            return;
+        }
         if (code.HasHostFeature(HostFeature::SSE41) && rounding != FP::RoundingMode::ToNearest_TieAwayFromZero && !exact) {
             const auto round_imm = ConvertRoundingModeToX64Immediate(rounding);
             EmitTwoOpVectorOperation<fsize, DefaultIndexer, 3>(code, ctx, inst, [&](const Xbyak::Xmm& result, const Xbyak::Xmm& xmm_a) {

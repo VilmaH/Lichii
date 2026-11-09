@@ -1155,6 +1155,20 @@ static void EmitFPRound(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, siz
     auto const rounding_mode = FP::RoundingMode(inst->GetArg(1).GetU8());
     bool const exact = inst->GetArg(2).GetU1();
     auto const round_imm = ConvertRoundingModeToX64Immediate(rounding_mode);
+    if (fsize != 16 && rounding_mode == FP::RoundingMode::ToNearest_TieAwayFromZero && !exact
+        && code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm x = ctx.reg_alloc.UseXmm(code, args[0]);
+        const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
+        const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
+        EmitFPCheckInputDenormal(code, ctx, ctx.FPCR(), fsize, false, x, tmp);
+        EmitFPRoundTieAway(code, fsize, false, result, x, tmp, false);
+        if (ctx.FPCR().DN()) {
+            fsize == 64 ? ForceToDefaultNaN<64>(code, result) : ForceToDefaultNaN<32>(code, result);
+        }
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     if (fsize != 16 && code.HasHostFeature(HostFeature::SSE41) && round_imm && !exact) {
         fsize == 64
             ? FPTwoOp<64>(code, ctx, inst, [&](Xbyak::Xmm result) { code.roundsd(result, result, *round_imm); })
