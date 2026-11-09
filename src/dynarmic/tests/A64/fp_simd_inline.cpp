@@ -499,3 +499,73 @@ TEST_CASE("A64: SSHL/USHL 8/16-bit", "[a64][fp_inline]") {
     CheckShift<u16>(0x2E624420, "USHL V0.4H, V1.4H, V2.4H", false);
 }
 
+namespace {
+
+// Narrows the elements of V1 (Wide) into Narrow with saturation; checks the result and FPSR.QC.
+template<typename Wide, typename Narrow>
+void CheckNarrow(u32 instruction, const char* name, bool upper) {
+    constexpr size_t lanes = 16 / sizeof(Wide);
+    using SignedWide = std::make_signed_t<Wide>;
+    constexpr bool from_signed = std::is_signed_v<Wide>;
+    const auto saturate = [](Wide x, bool& qc) -> Narrow {
+        const Wide lo = 0;
+        const Wide hi = Wide(std::numeric_limits<Narrow>::max());
+        if (from_signed && SignedWide(x) < SignedWide(lo)) {
+            qc = true;
+            return 0;
+        }
+        if (x > hi) {
+            qc = true;
+            return std::numeric_limits<Narrow>::max();
+        }
+        return Narrow(x);
+    };
+    const std::vector<u64> edges{0, 1, 0x7F, 0x80, 0xFF, 0x100, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+                                 0x100000000, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFF00000000, 0xFFFFFFFFFFFFFFFF, 0x00000001FFFFFFFF};
+    Runner runner{instruction};
+    Mismatches mismatches;
+    std::mt19937_64 rng(11);
+    const Vector v0{0x0123456789ABCDEF, 0xFEDCBA9876543210};
+    for (size_t iteration = 0; iteration < 4000; iteration++) {
+        std::array<Wide, lanes> in{};
+        std::array<Narrow, lanes * 2> out{};
+        bool qc = false;
+        for (size_t j = 0; j < lanes; j++) {
+            switch (iteration % 3) {
+            case 0:
+                in[j] = Wide(edges[rng() % edges.size()]);
+                break;
+            case 1:
+                in[j] = Wide(rng());
+                break;
+            case 2:
+                in[j] = Wide(rng() % (u64(std::numeric_limits<Narrow>::max()) * 2 + 2));
+                break;
+            }
+            out[j] = saturate(in[j], qc);
+        }
+        Vector vin, expected;
+        std::memcpy(&vin, in.data(), 16);
+        std::memcpy(&expected, out.data(), 16);
+        if (upper) {
+            expected = {v0[0], expected[0]};
+        }
+        runner.Run(0, vin, {}, v0);
+        const bool got_qc = (runner.Fpsr() & FPSR_QC) != 0;
+        if (runner.V0() != expected || got_qc != qc) {
+            mismatches.Report(std::string(name) + " in=" + Hex(vin[1]) + Hex(vin[0]) + " got=" + Hex(runner.V0()[1]) + Hex(runner.V0()[0]) + " qc=" + std::to_string(got_qc)
+                              + " expected=" + Hex(expected[1]) + Hex(expected[0]) + " qc=" + std::to_string(qc));
+        }
+    }
+}
+
+}  // namespace
+
+TEST_CASE("A64: UQXTN/SQXTUN", "[a64][fp_inline]") {
+    CheckNarrow<u16, u8>(0x2E214820, "UQXTN V0.8B, V1.8H", false);
+    CheckNarrow<u32, u16>(0x2E614820, "UQXTN V0.4H, V1.4S", false);
+    CheckNarrow<u64, u32>(0x2EA14820, "UQXTN V0.2S, V1.2D", false);
+    CheckNarrow<u16, u8>(0x6E214820, "UQXTN2 V0.16B, V1.8H", true);
+    CheckNarrow<s64, u32>(0x2EA12820, "SQXTUN V0.2S, V1.2D", false);
+    CheckNarrow<s64, u32>(0x6EA12820, "SQXTUN2 V0.4S, V1.2D", true);
+}

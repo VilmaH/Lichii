@@ -5028,17 +5028,40 @@ void EmitX64::EmitVectorSignedSaturatedNarrowToUnsigned32(EmitContext& ctx, IR::
     });
 }
 
+// 64-bit to 32-bit narrowing: an element saturates iff its upper half is non-zero.
+static void EmitSaturatedNarrow64To32(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, bool is_signed) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto const src = ctx.reg_alloc.UseXmm(code, args[0]);
+    auto const dest = ctx.reg_alloc.ScratchXmm(code);
+    auto const saturated = ctx.reg_alloc.ScratchXmm(code);
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr(code).cvt32();
+
+    code.pshufd(saturated, src, 0b11110101);
+    code.pxor(xmm0, xmm0);
+    code.pcmpeqd(xmm0, saturated);
+    code.movmskps(bit, xmm0);
+    code.xor_(bit, 0b1111);
+    code.or_(code.dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+    if (is_signed) {
+        code.psrad(saturated, 31);  // negative elements saturate to 0
+    }
+    code.pcmpeqd(dest, dest);
+    code.pxor(xmm0, dest);  // all-ones where the element saturates
+    code.movdqa(dest, src);
+    code.por(dest, xmm0);
+    if (is_signed) {
+        code.pandn(saturated, dest);
+        code.pshufd(dest, saturated, 0b00001000);
+    } else {
+        code.pshufd(dest, dest, 0b00001000);
+    }
+    code.movq(dest, dest);
+
+    ctx.reg_alloc.DefineValue(code, inst, dest);
+}
+
 void EmitX64::EmitVectorSignedSaturatedNarrowToUnsigned64(EmitContext& ctx, IR::Inst* inst) {
-    EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u32>& result, const VectorArray<s64>& a) {
-        result = {};
-        bool qc_flag = false;
-        for (size_t i = 0; i < a.size(); ++i) {
-            const s64 saturated = std::clamp<s64>(a[i], 0, 0xFFFFFFFF);
-            result[i] = static_cast<u32>(saturated);
-            qc_flag |= saturated != a[i];
-        }
-        return qc_flag;
-    });
+    EmitSaturatedNarrow64To32(code, ctx, inst, true);
 }
 
 static void EmitVectorSignedSaturatedNeg(size_t esize, BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
@@ -6208,19 +6231,49 @@ void EmitX64::EmitVectorUnsignedSaturatedAccumulateSigned64(EmitContext& ctx, IR
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedNarrow16(EmitContext& ctx, IR::Inst* inst) {
-    EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u8>& result, const VectorArray<u16>& a) {
-        result = {};
-        bool qc_flag = false;
-        for (size_t i = 0; i < a.size(); ++i) {
-            const u16 saturated = std::clamp<u16>(a[i], 0, 0xFF);
-            result[i] = static_cast<u8>(saturated);
-            qc_flag |= saturated != a[i];
-        }
-        return qc_flag;
-    });
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto const src = ctx.reg_alloc.UseXmm(code, args[0]);
+    auto const dest = ctx.reg_alloc.ScratchXmm(code);
+    auto const excess = ctx.reg_alloc.ScratchXmm(code);
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr(code).cvt32();
+
+    // dest = src - max(src - 0xFF, 0) = min(src, 0xFF)
+    code.movdqa(excess, src);
+    code.psubusw(excess, code.Const(xword, 0x00FF00FF00FF00FF, 0x00FF00FF00FF00FF));
+    code.movdqa(dest, src);
+    code.psubw(dest, excess);
+    code.pxor(xmm0, xmm0);
+    code.packuswb(dest, xmm0);
+
+    code.pcmpeqw(excess, xmm0);
+    code.pmovmskb(bit, excess);
+    code.xor_(bit, 0xFFFF);
+    code.or_(code.dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    ctx.reg_alloc.DefineValue(code, inst, dest);
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedNarrow32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::SSE41)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        auto const src = ctx.reg_alloc.UseXmm(code, args[0]);
+        auto const dest = ctx.reg_alloc.ScratchXmm(code);
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr(code).cvt32();
+
+        code.movdqa(dest, src);
+        code.pminud(dest, code.Const(xword, 0x0000FFFF0000FFFF, 0x0000FFFF0000FFFF));
+        code.movdqa(xmm0, dest);
+        code.pcmpeqd(xmm0, src);
+        code.movmskps(bit, xmm0);
+        code.xor_(bit, 0b1111);
+        code.or_(code.dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+        code.pxor(xmm0, xmm0);
+        code.packusdw(dest, xmm0);
+
+        ctx.reg_alloc.DefineValue(code, inst, dest);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u16>& result, const VectorArray<u32>& a) {
         result = {};
         bool qc_flag = false;
@@ -6234,16 +6287,7 @@ void EmitX64::EmitVectorUnsignedSaturatedNarrow32(EmitContext& ctx, IR::Inst* in
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedNarrow64(EmitContext& ctx, IR::Inst* inst) {
-    EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u32>& result, const VectorArray<u64>& a) {
-        result = {};
-        bool qc_flag = false;
-        for (size_t i = 0; i < a.size(); ++i) {
-            const u64 saturated = std::clamp<u64>(a[i], 0, 0xFFFFFFFF);
-            result[i] = static_cast<u32>(saturated);
-            qc_flag |= saturated != a[i];
-        }
-        return qc_flag;
-    });
+    EmitSaturatedNarrow64To32(code, ctx, inst, false);
 }
 
 template<typename T>
