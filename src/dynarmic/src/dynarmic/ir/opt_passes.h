@@ -27,6 +27,9 @@ namespace Dynarmic::Optimization {
 struct PolyfillOptions {
     bool sha256 = false;
     bool vector_multiply_widen = false;
+    /// The backend implements ConditionalSelectWithFlags* and wants in-block NZCV values passed to
+    /// conditional selects directly, with the last NZCV store of a conditional block moved to its end.
+    bool forward_nzcv = false;
 
     bool operator==(const PolyfillOptions&) const = default;
 };

@@ -292,10 +292,14 @@ void EmitX64::EmitAddCycles(size_t cycles) {
     code.sub(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], static_cast<u32>(cycles));
 }
 
-Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
+Xbyak::Label EmitX64::EmitCond(IR::Cond cond, std::optional<Xbyak::Reg32> nzcv) {
     Xbyak::Label pass;
 
-    code.mov(eax, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
+    if (!nzcv) {
+        code.mov(eax, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
+    } else if (nzcv->getIdx() != eax.getIdx()) {
+        code.mov(eax, *nzcv);
+    }
 
     code.LoadRequiredFlagsForCondFromRax(cond);
 

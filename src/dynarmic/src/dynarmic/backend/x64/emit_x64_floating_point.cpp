@@ -153,7 +153,8 @@ SharedLabel ProcessNaN(BlockOfCode& code, EmitContext& ctx, Xbyak::Xmm a) {
 template<size_t fsize>
 void PostProcessNaN(BlockOfCode& code, Xbyak::Xmm result, Xbyak::Xmm tmp) {
     code.movaps(tmp, result);
-    FCODE(cmpunordp)(tmp, tmp);
+    // Scalar compare: the upper lanes may hold other vector elements, which must not raise exceptions.
+    FCODE(cmpunords)(tmp, tmp);
     ICODE(psll)(tmp, int(fsize - 1));
     code.xorps(result, tmp);
 }

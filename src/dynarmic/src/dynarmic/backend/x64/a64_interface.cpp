@@ -55,6 +55,7 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
     return Optimization::PolyfillOptions{
         .sha256 = !code.HasHostFeature(HostFeature::SHA),
         .vector_multiply_widen = true,
+        .forward_nzcv = true,
     };
 }
 
