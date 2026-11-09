@@ -67,6 +67,8 @@ public:
     void GenMemory128Accessors();
     void GenFastmemFallbacks();
     void GenTerminalHandlers();
+    void EmitTerminalLocationDescriptor();
+    void EmitFastDispatchEntry();
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);
@@ -133,8 +135,8 @@ public:
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
     ::Common::unordered_set<DoNotFastmemMarker> do_not_fastmem;
     boost::container::stable_vector<Xbyak::Label> shared_labels;
-    const void* terminal_handler_pop_rsb_hint = nullptr;
-    const void* terminal_handler_fast_dispatch_hint = nullptr;
+    const void* terminal_handler_rsb_miss = nullptr;
+    const void* terminal_handler_fast_dispatch_miss = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;

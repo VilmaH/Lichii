@@ -92,8 +92,11 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     // Start emitting.
     code.align();
     const auto* const entrypoint = code.getCurr();
+#ifndef _WIN32
+    // Frame pointer for perf unwinding; Windows unwinds through the registered unwind info instead
     code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
     code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+#endif
 
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
@@ -147,7 +150,9 @@ finish_this_inst:
     reg_alloc.AssertNoMoreUses();
     if (conf.enable_cycle_counting)
         EmitAddCycles(block.CycleCount());
+#ifndef _WIN32
     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+#endif
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
@@ -185,63 +190,49 @@ void A64EmitX64::ClearFastDispatchTable() {
     }
 }
 
-void A64EmitX64::GenTerminalHandlers() {
-    // PC ends up in rcx, location_descriptor ends up in rbx
-    //static_assert(ABI_ALL_CALLEE_SAVE.test(size_t(HostLoc::R12)));
-    const auto calculate_location_descriptor = [this] {
-        // This calculation has to match up with A64::LocationDescriptor::UniqueHash
-        // TODO: Optimization is available here based on known state of fpcr.
-        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
-        code.mov(rcx, A64::LocationDescriptor::pc_mask);
-        code.and_(rcx, rdi);
-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
-        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
-        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
-        code.or_(rbx, rcx);
-    };
+void A64EmitX64::EmitTerminalLocationDescriptor() {
+    // This calculation has to match up with A64::LocationDescriptor::UniqueHash
+    code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
+    code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+    code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+    static_assert(A64::LocationDescriptor::pc_mask == ~u64(0) >> (64 - A64::LocationDescriptor::pc_bit_count));
+    code.mov(rcx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+    code.shl(rcx, 64 - A64::LocationDescriptor::pc_bit_count);
+    code.shr(rcx, 64 - A64::LocationDescriptor::pc_bit_count);
+    code.or_(rbx, rcx);
+}
 
-    Xbyak::Label fast_dispatch_cache_miss;
-    Xbyak::Label rsb_cache_miss;
-
-    code.align();
-    terminal_handler_pop_rsb_hint = code.getCurr<const void*>();
-    calculate_location_descriptor();
-    code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
-    code.sub(eax, 1);
-    code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
-    code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
-    code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        code.jne(rsb_cache_miss, code.T_NEAR);
-    } else {
-        code.jne(code.GetReturnFromRunCodeAddress());
+void A64EmitX64::EmitFastDispatchEntry() {
+    // r12 = &fast_dispatch_table[hash(rbx)], must match fast_dispatch_table_lookup
+    code.mov(r8, u64(fast_dispatch_table.data()));
+    code.mov(r12, rbx);
+    if (code.HasHostFeature(HostFeature::SSE42)) {
+        code.crc32(r12, r8);
     }
-    code.mov(rax, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
-    code.jmp(rax);
-    PerfMapRegister(terminal_handler_pop_rsb_hint, code.getCurr(), "a64_terminal_handler_pop_rsb_hint");
+    code.and_(r12d, fast_dispatch_table_mask);
+    code.lea(r12, ptr[r8 + r12]);
+}
 
+void A64EmitX64::GenTerminalHandlers() {
+    // Miss paths of the inline PopRSBHint/FastDispatchHint terminals; rbx holds the location descriptor
+    terminal_handler_rsb_miss = code.GetReturnFromRunCodeAddress();
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        Xbyak::Label fast_dispatch_cache_miss;
+
         code.align();
-        terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
-        calculate_location_descriptor();
-        code.L(rsb_cache_miss);
-        code.mov(r8, u64(fast_dispatch_table.data()));
-        //code.mov(r12, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
-        code.mov(r12, rbx);
-        if (code.HasHostFeature(HostFeature::SSE42)) {
-            code.crc32(r12, r8);
-        }
-        code.and_(r12d, fast_dispatch_table_mask);
-        code.lea(r12, ptr[r8 + r12]);
+        terminal_handler_rsb_miss = code.getCurr<const void*>();
+        EmitFastDispatchEntry();
         code.cmp(rbx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
-        code.jne(fast_dispatch_cache_miss, code.T_NEAR);
+        code.jne(fast_dispatch_cache_miss);
         code.jmp(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
         code.L(fast_dispatch_cache_miss);
+        // r12 also holds the table entry here
+        terminal_handler_fast_dispatch_miss = code.getCurr<const void*>();
         code.mov(qword[r12 + offsetof(FastDispatchEntry, location_descriptor)], rbx);
         code.LookupBlock();
         code.mov(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)], rax);
         code.jmp(rax);
-        PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
+        PerfMapRegister(terminal_handler_rsb_miss, code.getCurr(), "a64_terminal_handler_fast_dispatch_miss");
 
         code.align();
         fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
@@ -672,7 +663,15 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
     if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
-        e.code.jmp(e.terminal_handler_pop_rsb_hint);
+        // Inline so each guest return gets its own host indirect jump (and BTB entry)
+        e.EmitTerminalLocationDescriptor();
+        e.code.mov(eax, dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+        e.code.dec(eax);
+        e.code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+        e.code.mov(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
+        e.code.cmp(rbx, qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+        e.code.jne(e.terminal_handler_rsb_miss);
+        e.code.jmp(qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
     } else {
         e.code.ReturnFromRunCode();
     }
@@ -683,7 +682,11 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
     if (!e.conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
         e.code.ReturnFromRunCode();
     } else {
-        e.code.jmp(e.terminal_handler_fast_dispatch_hint);
+        e.EmitTerminalLocationDescriptor();
+        e.EmitFastDispatchEntry();
+        e.code.cmp(rbx, qword[r12 + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
+        e.code.jne(e.terminal_handler_fast_dispatch_miss);
+        e.code.jmp(qword[r12 + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]);
     }
     return true;
 }
