@@ -85,8 +85,9 @@ public:
         Inst(Opcode::A64DataSynchronizationBarrier);
     }
 
-    void DataMemoryBarrier() noexcept {
-        Inst(Opcode::A64DataMemoryBarrier);
+    /// crm: the DMB option field (bits 1:0 are 01 = loads only, 10 = stores only, 11 = all).
+    void DataMemoryBarrier(u8 crm) noexcept {
+        Inst(Opcode::A64DataMemoryBarrier, IR::Value{crm});
     }
 
     void InstructionSynchronizationBarrier() noexcept {

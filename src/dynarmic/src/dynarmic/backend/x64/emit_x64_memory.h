@@ -246,48 +246,27 @@ template<>
 
 template<std::size_t bitsize>
 const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
-    if (ordered) {
-        if constexpr (bitsize != 128) {
-            code.xor_(Xbyak::Reg32(value_idx), Xbyak::Reg32(value_idx));
-        } else {
-            code.xor_(eax, eax);
-            code.xor_(ebx, ebx);
-            code.xor_(ecx, ecx);
-            code.xor_(edx, edx);
-        }
+    // Acquire loads (LDAR, LDAPR, exclusive and atomic reads) need no locked instruction on x86:
+    // loads are not reordered with other loads, and ordered stores are emitted as xchg, so a
+    // plain mov gives the same order (the C++11 seq_cst mapping). lock xadd [addr], 0 cost ~20
+    // cycles and took the cache line exclusively, which made cores polling a flag fight over it.
+    // 128-bit reads still need cmpxchg16b to be single-copy atomic.
+    if (ordered && bitsize == 128) {
+        code.xor_(eax, eax);
+        code.xor_(ebx, ebx);
+        code.xor_(ecx, ecx);
+        code.xor_(edx, edx);
 
         const void* fastmem_location = code.getCurr();
-        switch (bitsize) {
-        case 8:
-            code.lock();
-            code.xadd(code.byte[addr], Xbyak::Reg32(value_idx).cvt8());
-            break;
-        case 16:
-            code.lock();
-            code.xadd(word[addr], Xbyak::Reg64(value_idx).cvt16());
-            break;
-        case 32:
-            code.lock();
-            code.xadd(dword[addr], Xbyak::Reg64(value_idx).cvt32());
-            break;
-        case 64:
-            code.lock();
-            code.xadd(qword[addr], Xbyak::Reg64(value_idx));
-            break;
-        case 128:
-            code.lock();
-            code.cmpxchg16b(xword[addr]);
-            if (code.HasHostFeature(HostFeature::SSE41)) {
-                code.movq(Xbyak::Xmm(value_idx), rax);
-                code.pinsrq(Xbyak::Xmm(value_idx), rdx, 1);
-            } else {
-                code.movq(Xbyak::Xmm(value_idx), rax);
-                code.movq(xmm0, rdx);
-                code.punpcklqdq(Xbyak::Xmm(value_idx), xmm0);
-            }
-            break;
-        default:
-            UNREACHABLE();
+        code.lock();
+        code.cmpxchg16b(xword[addr]);
+        if (code.HasHostFeature(HostFeature::SSE41)) {
+            code.movq(Xbyak::Xmm(value_idx), rax);
+            code.pinsrq(Xbyak::Xmm(value_idx), rdx, 1);
+        } else {
+            code.movq(Xbyak::Xmm(value_idx), rax);
+            code.movq(xmm0, rdx);
+            code.punpcklqdq(Xbyak::Xmm(value_idx), xmm0);
         }
         return fastmem_location;
     } else {

@@ -2856,3 +2856,88 @@ TEST_CASE("A64: Rounding", "[a64]") {
     CHECK(jit.GetVector(5) == Vector{0x4000000040000000, 0x4000000040000000});
     CHECK(jit.GetVector(6) == Vector{0x4000000040000000, 0x4000000040000000});
 }
+
+namespace {
+// LDAR/LDAPR at every size, the three DMB kinds, then LDADDAL, CASAL and SWPAL on one doubleword.
+constexpr std::array<u32, 12> acquire_and_atomic_program{
+    0xc8dffc01,  // LDAR X1, [X0]
+    0xb8bfc002,  // LDAPR W2, [X0]
+    0x08dffc03,  // LDARB W3, [X0]
+    0x48dffc04,  // LDARH W4, [X0]
+    0xd50339bf,  // DMB ISHLD
+    0xd5033abf,  // DMB ISHST
+    0xd5033bbf,  // DMB ISH
+    0xf8e50006,  // LDADDAL X5, X6, [X0]
+    0xc8e7fc08,  // CASAL X7, X8, [X0]
+    0xf8e9800a,  // SWPAL X9, X10, [X0]
+    0xc8dffc0b,  // LDAR X11, [X0]
+    0x14000000,  // B .
+};
+
+template<typename Env>
+void RunAcquireAndAtomicProgram(Env& env, A64::Jit& jit, u64 data_address) {
+    jit.SetPC(0);
+    jit.SetRegister(0, data_address);
+    jit.SetRegister(5, 1);
+    jit.SetRegister(7, 0x1122334455667789);
+    jit.SetRegister(8, 0xaaaa);
+    jit.SetRegister(9, 0xbbbb);
+    env.ticks_left = 40;
+    CheckedRun([&]() { jit.Run(); });
+
+    REQUIRE(jit.GetRegister(1) == 0x1122334455667788);
+    REQUIRE(jit.GetRegister(2) == 0x55667788);
+    REQUIRE(jit.GetRegister(3) == 0x88);
+    REQUIRE(jit.GetRegister(4) == 0x7788);
+    REQUIRE(jit.GetRegister(6) == 0x1122334455667788);
+    REQUIRE(jit.GetRegister(7) == 0x1122334455667789);
+    REQUIRE(jit.GetRegister(10) == 0xaaaa);
+    REQUIRE(jit.GetRegister(11) == 0xbbbb);
+    REQUIRE(env.MemoryRead(data_address, sizeof(u64)) == 0xbbbb);
+}
+}  // namespace
+
+TEST_CASE("A64: acquire loads, barriers and LSE atomics (callbacks)", "[a64]") {
+    A64TestEnv env;
+    ExclusiveMonitor monitor{1};
+    A64::UserConfig conf;
+    conf.callbacks = &env;
+    conf.processor_id = 0;
+    conf.global_monitor = &monitor;
+    A64::Jit jit{conf};
+
+    env.code_mem.assign(acquire_and_atomic_program.begin(), acquire_and_atomic_program.end());
+    env.MemoryWrite(0x100, 0x1122334455667788, sizeof(u64));
+    RunAcquireAndAtomicProgram(env, jit, 0x100);
+}
+
+TEST_CASE("A64: acquire loads, barriers and LSE atomics (fastmem)", "[a64]") {
+    constexpr size_t address_width = 12;
+    constexpr size_t memory_size = 1ull << address_width;
+    constexpr size_t page_size = 4 * 1024;
+    constexpr size_t buffer_size = 2 * page_size;
+    alignas(16) char buffer[buffer_size];
+    void* buffer_ptr = reinterpret_cast<void*>(buffer);
+    size_t buffer_size_nconst = buffer_size;
+    char* backing_memory = reinterpret_cast<char*>(std::align(page_size, memory_size, buffer_ptr, buffer_size_nconst));
+
+    A64FastmemTestEnv env{backing_memory};
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    conf.fastmem_pointer = reinterpret_cast<uintptr_t>(backing_memory);
+    conf.fastmem_address_space_bits = address_width;
+    conf.recompile_on_fastmem_failure = false;
+    conf.silently_mirror_fastmem = true;
+    conf.processor_id = 0;
+    ExclusiveMonitor monitor{1};
+    conf.global_monitor = &monitor;
+    conf.fastmem_exclusive_access = true;
+    A64::Jit jit{conf};
+
+    memset(backing_memory, 0, memory_size);
+    for (size_t i = 0; i < acquire_and_atomic_program.size(); ++i) {
+        env.MemoryWrite(i * 4, acquire_and_atomic_program[i], sizeof(u32));
+    }
+    env.MemoryWrite(0x100, 0x1122334455667788, sizeof(u64));
+    RunAcquireAndAtomicProgram(env, jit, 0x100);
+}

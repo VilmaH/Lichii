@@ -86,8 +86,8 @@ bool TranslatorVisitor::DSB(Imm<4> /*CRm*/) {
     return true;
 }
 
-bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
-    ir.DataMemoryBarrier();
+bool TranslatorVisitor::DMB(Imm<4> CRm) {
+    ir.DataMemoryBarrier(CRm.ZeroExtend<u8>());
     return true;
 }
 

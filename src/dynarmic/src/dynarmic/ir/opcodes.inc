@@ -688,7 +688,7 @@ A64OPC(ExceptionRaised,                                     Void,           U64,
 A64OPC(DataCacheOperationRaised,                            Void,           U64,            U64,            U64                             )
 A64OPC(InstructionCacheOperationRaised,                     Void,           U64,            U64                                             )
 A64OPC(DataSynchronizationBarrier,                          Void,                                                                           )
-A64OPC(DataMemoryBarrier,                                   Void,                                                                           )
+A64OPC(DataMemoryBarrier,                                   Void,           U8                                                              )
 A64OPC(InstructionSynchronizationBarrier,                   Void,                                                                           )
 A64OPC(GetCNTFRQ,                                           U32,                                                                            )
 A64OPC(GetCNTPCT,                                           U64,                                                                            )

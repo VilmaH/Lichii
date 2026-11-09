@@ -539,8 +539,20 @@ void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
     code.lfence();
 }
 
-void A64EmitX64::EmitA64DataMemoryBarrier(A64EmitContext&, IR::Inst*) {
-    code.mfence();
+void A64EmitX64::EmitA64DataMemoryBarrier(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    switch (args[0].GetImmediateU8() & 0b11) {
+    case 0b01: // DMB *LD: x86 never reorders a load with a later load or store.
+    case 0b10: // DMB *ST: x86 never reorders stores with each other.
+        return;
+    default:
+        // A full barrier only has to order earlier stores before later loads. A locked
+        // instruction does that for ordinary memory at about half the cost of mfence on Intel
+        // cores up to Skylake; mfence also orders non-temporal stores, which JIT code never emits.
+        code.lock();
+        code.or_(dword[rsp], 0);
+        return;
+    }
 }
 
 void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, IR::Inst*) {
