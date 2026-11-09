@@ -56,6 +56,12 @@ void EmitX64::EmitPack2x64To1x128(EmitContext& ctx, IR::Inst* inst) {
 void EmitX64::EmitLeastSignificantWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
+    // Only the low 32 bits of a U32 in an XMM register are meaningful.
+    if (args[0].IsInXmm(ctx.reg_alloc)) {
+        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+        return;
+    }
+
     // TODO: DefineValue directly on Argument
     const Xbyak::Reg64 res = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.mov(res.cvt32(), res.cvt32());
@@ -136,17 +142,8 @@ void EmitX64::EmitTestBit(EmitContext& ctx, IR::Inst* inst) {
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
 
-static void EmitConditionalSelect(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bitsize) {
-    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    const Xbyak::Reg32 nzcv = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX).cvt32();
-    const Xbyak::Reg then_ = ctx.reg_alloc.UseGpr(code, args[1]).changeBit(bitsize);
-    const Xbyak::Reg else_ = ctx.reg_alloc.UseScratchGpr(code, args[2]).changeBit(bitsize);
-
-    code.mov(nzcv, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
-
-    code.LoadRequiredFlagsForCondFromRax(args[0].GetImmediateCond());
-
-    switch (args[0].GetImmediateCond()) {
+static void EmitCmov(BlockOfCode& code, IR::Cond cond, const Xbyak::Reg& else_, const Xbyak::Reg& then_) {
+    switch (cond) {
     case IR::Cond::EQ:
         code.cmovz(else_, then_);
         break;
@@ -196,6 +193,18 @@ static void EmitConditionalSelect(BlockOfCode& code, EmitContext& ctx, IR::Inst*
     default:
         UNREACHABLE();
     }
+}
+
+static void EmitConditionalSelect(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bitsize) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Reg32 nzcv = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX).cvt32();
+    const Xbyak::Reg then_ = ctx.reg_alloc.UseGpr(code, args[1]).changeBit(bitsize);
+    const Xbyak::Reg else_ = ctx.reg_alloc.UseScratchGpr(code, args[2]).changeBit(bitsize);
+
+    code.mov(nzcv, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
+
+    code.LoadRequiredFlagsForCondFromRax(args[0].GetImmediateCond());
+    EmitCmov(code, args[0].GetImmediateCond(), else_, then_);
 
     ctx.reg_alloc.DefineValue(code, inst, else_);
 }
@@ -210,6 +219,36 @@ void EmitX64::EmitConditionalSelect64(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitConditionalSelectNZCV(EmitContext& ctx, IR::Inst* inst) {
     EmitConditionalSelect(code, ctx, inst, 32);
+}
+
+// As above, with the flags given as an NZCV value instead of read from the guest state.
+static void EmitConditionalSelectWithFlags(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bitsize) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+#ifdef __APPLE__
+    // LoadRequiredFlagsForCondFromRax modifies rax under Rosetta.
+    ctx.reg_alloc.UseScratch(code, args[1], HostLoc::RAX);
+#else
+    ctx.reg_alloc.Use(code, args[1], HostLoc::RAX);
+#endif
+    const Xbyak::Reg then_ = ctx.reg_alloc.UseGpr(code, args[2]).changeBit(bitsize);
+    const Xbyak::Reg else_ = ctx.reg_alloc.UseScratchGpr(code, args[3]).changeBit(bitsize);
+
+    code.LoadRequiredFlagsForCondFromRax(args[0].GetImmediateCond());
+    EmitCmov(code, args[0].GetImmediateCond(), else_, then_);
+
+    ctx.reg_alloc.DefineValue(code, inst, else_);
+}
+
+void EmitX64::EmitConditionalSelectWithFlags32(EmitContext& ctx, IR::Inst* inst) {
+    EmitConditionalSelectWithFlags(code, ctx, inst, 32);
+}
+
+void EmitX64::EmitConditionalSelectWithFlags64(EmitContext& ctx, IR::Inst* inst) {
+    EmitConditionalSelectWithFlags(code, ctx, inst, 64);
+}
+
+void EmitX64::EmitConditionalSelectWithFlagsNZCV(EmitContext& ctx, IR::Inst* inst) {
+    EmitConditionalSelectWithFlags(code, ctx, inst, 32);
 }
 
 static void EmitExtractRegister(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit_size) {
@@ -1509,6 +1548,20 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // Keep FP results in XMM. Bits 32-127 are zeroed, which EmitZeroExtendLongToQuad relies on.
+    if (args[0].IsInXmm(ctx.reg_alloc) && code.HasHostFeature(HostFeature::AVX)) {
+        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(code, args[0]);
+        const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
+        code.vinsertps(result, source, source, 0b00001110);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
+    if (args[0].IsInXmm(ctx.reg_alloc) && code.HasHostFeature(HostFeature::SSE41)) {
+        const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
+        code.insertps(result, result, 0b00001110);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.mov(result.cvt32(), result.cvt32());  // x64 zeros upper 32 bits on a 32-bit move
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1516,14 +1569,22 @@ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendLongToQuad(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // A ZeroExtendWordToLong result in an XMM register is already zero above bit 31,
+    // whether it was produced there or moved there with movq/movsd.
+    if (args[0].IsInXmm(ctx.reg_alloc) && inst->GetArg(0).GetInst()->GetOpcode() == IR::Opcode::ZeroExtendWordToLong) {
+        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+        return;
+    }
     if (args[0].IsInGpr(ctx.reg_alloc)) {
         const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
         const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
         code.movq(result, source);
         ctx.reg_alloc.DefineValue(code, inst, result);
     } else {
-        const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
-        code.movq(result, result);
+        // Non-destructive, so a source that is still live is not spilled to make a scratch copy.
+        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(code, args[0]);
+        const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
+        code.movq(result, source);
         ctx.reg_alloc.DefineValue(code, inst, result);
     }
 }

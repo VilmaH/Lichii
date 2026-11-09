@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <optional>
 #include <bit>
 
 #include "common/container/unordered_map.h"
@@ -495,7 +496,22 @@ static void ReplaceUsesWith(IR::Inst& inst, bool is_32_bit, u64 value) {
     }
 }
 
-static void A64GetSetElimination(IR::Block& block) {
+// An A64SetNZCV can be moved past these without changing what any instruction or exit observes.
+static bool CanSinkNZCVStorePast(IR::Opcode op) {
+    switch (op) {
+    case IR::Opcode::A64SetW:
+    case IR::Opcode::A64SetX:
+    case IR::Opcode::A64SetS:
+    case IR::Opcode::A64SetD:
+    case IR::Opcode::A64SetQ:
+    case IR::Opcode::A64SetSP:
+        return true;
+    default:
+        return !MayHaveSideEffects(op) && !IsMemoryRead(op) && !ReadsFromCPSR(op);
+    }
+}
+
+static void A64GetSetElimination(IR::Block& block, bool forward_nzcv) {
     using Iterator = IR::Block::iterator;
 
     enum class TrackingType {
@@ -583,7 +599,42 @@ static void A64GetSetElimination(IR::Block& block) {
             break;
         }
         case IR::Opcode::A64GetNZCVRaw: {
-            do_get(nzcv_info, inst, TrackingType::NZCVRaw);
+            if (!nzcv_info.register_value.IsEmpty() && nzcv_info.tracking_type == TrackingType::NZCV) {
+                // The store is observed and must stay, but its value is still known.
+                nzcv_info.set_instruction_present = false;
+            } else {
+                do_get(nzcv_info, inst, TrackingType::NZCVRaw);
+            }
+            break;
+        }
+        case IR::Opcode::A64GetCFlag: {
+            if (!nzcv_info.register_value.IsEmpty() && nzcv_info.tracking_type == TrackingType::NZCV) {
+                A64::IREmitter ir{block};
+                ir.SetInsertionPointBefore(&*inst);
+                inst->ReplaceUsesWith(ir.GetCFlagFromNZCV(IR::NZCV{nzcv_info.register_value}));
+            } else {
+                nzcv_info = {};
+            }
+            break;
+        }
+        case IR::Opcode::ConditionalSelect32:
+        case IR::Opcode::ConditionalSelect64:
+        case IR::Opcode::ConditionalSelectNZCV: {
+            if (forward_nzcv && !nzcv_info.register_value.IsEmpty() && nzcv_info.tracking_type == TrackingType::NZCV) {
+                const IR::Value cond = inst->GetArg(0);
+                const IR::Value then_ = inst->GetArg(1);
+                const IR::Value else_ = inst->GetArg(2);
+                inst->ClearArgs();
+                inst->op = opcode == IR::Opcode::ConditionalSelect32 ? IR::Opcode::ConditionalSelectWithFlags32
+                         : opcode == IR::Opcode::ConditionalSelect64 ? IR::Opcode::ConditionalSelectWithFlags64
+                                                                     : IR::Opcode::ConditionalSelectWithFlagsNZCV;
+                inst->SetArg(0, cond);
+                inst->SetArg(1, nzcv_info.register_value);
+                inst->SetArg(2, then_);
+                inst->SetArg(3, else_);
+            } else {
+                nzcv_info = {};
+            }
             break;
         }
         case IR::Opcode::A64SetW: {
@@ -636,9 +687,164 @@ static void A64GetSetElimination(IR::Block& block) {
         }
         }
     }
+
+    // Let a conditional terminal find the flags in the register the final store used
+    // by making that store the last instruction of the block.
+    const auto terminal = block.GetTerminal();
+    const auto* const term_if = std::get_if<IR::Term::If>(&terminal);
+    if (forward_nzcv && term_if && term_if->if_ != IR::Cond::AL && term_if->if_ != IR::Cond::NV
+        && nzcv_info.set_instruction_present && nzcv_info.tracking_type == TrackingType::NZCV) {
+        const auto set_inst = nzcv_info.last_set_instruction;
+        if (std::next(set_inst) != block.instructions.end()
+            && std::all_of(std::next(set_inst), block.instructions.end(), [](const IR::Inst& i) { return CanSinkNZCVStorePast(i.GetOpcode()); })) {
+            A64::IREmitter ir{block};
+            ir.SetNZCV(IR::NZCV{set_inst->GetArg(0)});
+            set_inst->Invalidate();
+            block.Instructions().erase(set_inst);
+        }
+    }
 }
 
 using Op = Dynarmic::IR::Opcode;
+
+// Bits of this U128 at and above the returned position are known to be zero.
+static size_t KnownZeroFrom(const IR::Value& value) {
+    const IR::Inst* const inst = value.GetInstRecursive();
+    switch (inst->GetOpcode()) {
+    case Op::ZeroExtendLongToQuad: {
+        const IR::Value arg = inst->GetArg(0);
+        if (arg.IsImmediate())
+            return 64;
+        switch (arg.GetInstRecursive()->GetOpcode()) {
+        case Op::ZeroExtendWordToLong:
+            return 32;
+        case Op::ZeroExtendHalfToLong:
+            return 16;
+        case Op::ZeroExtendByteToLong:
+            return 8;
+        default:
+            return 64;
+        }
+    }
+    case Op::VectorZeroUpper:
+        return 64;
+    default:
+        return 128;
+    }
+}
+
+// The low `bits` bits of the U64 `value`, if they can be had without a vector round trip.
+static std::optional<IR::Value> LowBitsOfLong(IR::IREmitter& ir, const IR::Value& value, size_t bits) {
+    if (bits == 64)
+        return value;
+    if (value.IsImmediate()) {
+        const u64 imm = value.GetImmediateAsU64();
+        switch (bits) {
+        case 32:
+            return IR::Value{u32(imm)};
+        case 16:
+            return IR::Value{u16(imm)};
+        default:
+            return IR::Value{u8(imm)};
+        }
+    }
+    const IR::Inst* const inst = value.GetInstRecursive();
+    const size_t source_bits = inst->GetOpcode() == Op::ZeroExtendWordToLong ? 32
+                             : inst->GetOpcode() == Op::ZeroExtendHalfToLong ? 16
+                             : inst->GetOpcode() == Op::ZeroExtendByteToLong ? 8
+                                                                              : 64;
+    if (source_bits == bits)
+        return inst->GetArg(0);
+    if (bits != 32)
+        return std::nullopt;
+    switch (source_bits) {
+    case 16:
+        return ir.ZeroExtendHalfToWord(IR::U16{inst->GetArg(0)});
+    case 8:
+        return ir.ZeroExtendByteToWord(IR::U8{inst->GetArg(0)});
+    default:
+        return ir.LeastSignificantWord(IR::U64{value});
+    }
+}
+
+// Scalar SIMD&FP registers are read with VectorGetElement(GetQ, 0) and written with
+// SetQ(ZeroExtendToQuad(x)). Once get/set elimination has forwarded the quad, fold the
+// round trip so x reaches the next scalar op directly.
+static void VectorElementFoldPass(IR::Block& block) {
+    IR::IREmitter ir{block};
+    for (auto it = block.instructions.rbegin(); it != block.instructions.rend(); ++it) {
+        IR::Inst& inst = *it;
+        switch (inst.GetOpcode()) {
+        case Op::VectorGetElement8:
+        case Op::VectorGetElement16:
+        case Op::VectorGetElement32:
+        case Op::VectorGetElement64: {
+            const size_t bits = inst.GetOpcode() == Op::VectorGetElement8 ? 8
+                              : inst.GetOpcode() == Op::VectorGetElement16 ? 16
+                              : inst.GetOpcode() == Op::VectorGetElement32 ? 32
+                                                                           : 64;
+            const size_t index = inst.GetArg(1).GetU8();
+            IR::Inst* vec = inst.GetArg(0).GetInstRecursive();
+            if (index == 0 && vec->GetOpcode() == Op::VectorZeroUpper) {
+                inst.SetArg(0, vec->GetArg(0));
+                vec = inst.GetArg(0).GetInstRecursive();
+            }
+            if (index * bits >= KnownZeroFrom(inst.GetArg(0))) {
+                inst.ReplaceUsesWith(bits == 64 ? IR::Value{u64(0)}
+                                   : bits == 32 ? IR::Value{u32(0)}
+                                   : bits == 16 ? IR::Value{u16(0)}
+                                                : IR::Value{u8(0)});
+            } else if (index == 0 && vec->GetOpcode() == Op::ZeroExtendLongToQuad) {
+                ir.SetInsertionPointBefore(&inst);
+                if (const auto low = LowBitsOfLong(ir, vec->GetArg(0), bits))
+                    inst.ReplaceUsesWith(*low);
+            }
+            break;
+        }
+        case Op::ZeroExtendLongToQuad: {
+            // ZeroExtendToQuad(VectorGetElement(w, 0)) is w itself when w is already zero above that element.
+            const IR::Value arg = inst.GetArg(0);
+            if (arg.IsImmediate())
+                break;
+            const IR::Inst* source = arg.GetInstRecursive();
+            size_t bits = 64;
+            switch (source->GetOpcode()) {
+            case Op::ZeroExtendWordToLong:
+                bits = 32;
+                break;
+            case Op::ZeroExtendHalfToLong:
+                bits = 16;
+                break;
+            case Op::ZeroExtendByteToLong:
+                bits = 8;
+                break;
+            default:
+                break;
+            }
+            if (bits != 64) {
+                if (source->GetArg(0).IsImmediate())
+                    break;
+                source = source->GetArg(0).GetInstRecursive();
+            }
+            const Op expected = bits == 64 ? Op::VectorGetElement64
+                              : bits == 32 ? Op::VectorGetElement32
+                              : bits == 16 ? Op::VectorGetElement16
+                                           : Op::VectorGetElement8;
+            if (source->GetOpcode() == expected && source->GetArg(1).GetU8() == 0 && KnownZeroFrom(source->GetArg(0)) <= bits)
+                inst.ReplaceUsesWith(source->GetArg(0));
+            break;
+        }
+        case Op::LeastSignificantWord: {
+            const IR::Value arg = inst.GetArg(0);
+            if (!arg.IsImmediate() && arg.GetInstRecursive()->GetOpcode() == Op::ZeroExtendWordToLong)
+                inst.ReplaceUsesWith(arg.GetInstRecursive()->GetArg(0));
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
 
 static IR::Value Value(bool is_32_bit, u64 value) {
     return is_32_bit ? IR::Value{u32(value)} : IR::Value{value};
@@ -1466,7 +1672,8 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
     Optimization::A64CallbackConfigPass(block, conf);
     Optimization::NamingPass(block);
     if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-        Optimization::A64GetSetElimination(block);
+        Optimization::A64GetSetElimination(block, polyfill_options.forward_nzcv);
+        Optimization::VectorElementFoldPass(block);
         Optimization::DeadCodeElimination(block);
     }
     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {

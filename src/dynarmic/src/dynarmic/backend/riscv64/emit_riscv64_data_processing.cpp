@@ -86,6 +86,21 @@ void EmitIR<IR::Opcode::ConditionalSelectNZCV>(biscuit::Assembler&, EmitContext&
 }
 
 template<>
+void EmitIR<IR::Opcode::ConditionalSelectWithFlags32>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::ConditionalSelectWithFlags64>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::ConditionalSelectWithFlagsNZCV>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
 void EmitIR<IR::Opcode::LogicalShiftLeft32>(biscuit::Assembler& as, EmitContext& ctx, IR::Inst* inst) {
     const auto carry_inst = inst->GetAssociatedPseudoOperation(IR::Opcode::GetCarryFromOp);
 

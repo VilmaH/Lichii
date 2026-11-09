@@ -88,6 +88,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     }(), any_xmm};
 
     A64EmitContext ctx{conf, reg_alloc, block, shared_labels};
+    nzcv_at_block_end.reset();
 
     // Start emitting.
     code.align();
@@ -308,6 +309,10 @@ void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(code, args[0]).cvt32();
     code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, cpsr_nzcv)], to_store);
+    // Nothing allocates a register between the last instruction and the terminal; rbp is restored there.
+    if (inst == &ctx.block.instructions.back() && to_store.getIdx() != rbp.getIdx()) {
+        nzcv_at_block_end = to_store;
+    }
 }
 
 void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
@@ -698,7 +703,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
         break;
     default:
-        Xbyak::Label pass = e.EmitCond(terminal.if_);
+        Xbyak::Label pass = e.EmitCond(terminal.if_, e.nzcv_at_block_end);
         e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
         e.code.L(pass);
         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);

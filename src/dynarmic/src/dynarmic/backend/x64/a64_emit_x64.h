@@ -140,6 +140,8 @@ public:
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;
+    /// Register still holding the NZCV value stored by the block's last instruction, for the terminal.
+    std::optional<Xbyak::Reg32> nzcv_at_block_end;
     void (*memory_write_128)() = nullptr;
     void (*memory_exclusive_write_128)() = nullptr;
 };

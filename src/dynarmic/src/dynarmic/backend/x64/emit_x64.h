@@ -105,7 +105,7 @@ public:
     // Helpers
     virtual std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const = 0;
     void EmitAddCycles(size_t cycles);
-    Xbyak::Label EmitCond(IR::Cond cond);
+    Xbyak::Label EmitCond(IR::Cond cond, std::optional<Xbyak::Reg32> nzcv = std::nullopt);
     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
 

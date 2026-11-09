@@ -239,6 +239,22 @@ void EmitIR<IR::Opcode::ConditionalSelectNZCV>(oaknut::CodeGenerator& code, Emit
     EmitIR<IR::Opcode::ConditionalSelect32>(code, ctx, inst);
 }
 
+// Only produced when PolyfillOptions::forward_nzcv is set, which this backend does not do.
+template<>
+void EmitIR<IR::Opcode::ConditionalSelectWithFlags32>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::ConditionalSelectWithFlags64>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::ConditionalSelectWithFlagsNZCV>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
 template<>
 void EmitIR<IR::Opcode::LogicalShiftLeft32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     const auto carry_inst = inst->GetAssociatedPseudoOperation(IR::Opcode::GetCarryFromOp);

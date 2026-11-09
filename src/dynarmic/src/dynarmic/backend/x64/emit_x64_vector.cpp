@@ -217,7 +217,11 @@ void EmitX64::EmitVectorGetElement32(EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[1].IsImmediate());
     const u8 index = args[1].GetImmediateU8();
 
-    // TODO: DefineValue directly on Argument for index == 0
+    // Element 0 is the low 32 bits of the vector: share its register. A GPR user gets a movd from the allocator.
+    if (index == 0) {
+        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+        return;
+    }
 
     const Xbyak::Reg32 dest = ctx.reg_alloc.ScratchGpr(code).cvt32();
 
@@ -239,11 +243,7 @@ void EmitX64::EmitVectorGetElement64(EmitContext& ctx, IR::Inst* inst) {
     const u8 index = args[1].GetImmediateU8();
 
     if (index == 0) {
-        // TODO: DefineValue directly on Argument for index == 0
-        const Xbyak::Reg64 dest = ctx.reg_alloc.ScratchGpr(code).cvt64();
-        auto const source = ctx.reg_alloc.UseXmm(code, args[0]);
-        code.movq(dest, source);
-        ctx.reg_alloc.DefineValue(code, inst, dest);
+        ctx.reg_alloc.DefineValue(code, inst, args[0]);
         return;
     }
 
