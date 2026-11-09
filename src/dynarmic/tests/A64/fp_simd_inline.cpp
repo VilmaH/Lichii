@@ -434,3 +434,68 @@ TEST_CASE("A64: FCVTAS/FCVTAU vector", "[a64][fp_inline]") {
     CheckVector<u64, false>(0x6E61C820, "FCVTAU V0.2D, V1.2D", true, true);
 }
 
+namespace {
+
+template<typename T>
+T ReferenceShift(T x, u8 shift_byte) {
+    using U = std::make_unsigned_t<T>;
+    constexpr int bits = int(sizeof(T) * 8);
+    const int shift = s8(shift_byte);
+    if (shift >= bits) {
+        return 0;
+    }
+    if (shift <= -bits) {
+        return std::is_signed_v<T> && x < 0 ? T(-1) : T(0);
+    }
+    if (shift < 0) {
+        return T(x >> -shift);
+    }
+    return T(U(U(x) << shift));
+}
+
+template<typename T>
+void CheckShift(u32 instruction, const char* name, bool q) {
+    constexpr size_t lanes = 16 / sizeof(T);
+    const size_t active = q ? lanes : lanes / 2;
+    constexpr int bits = int(sizeof(T) * 8);
+    const std::vector<int> edge_shifts{0, 1, -1, bits - 1, -(bits - 1), bits, -bits, bits + 1, -(bits + 1),
+                                       7, -7, 8, -8, 9, -9, 15, -15, 16, -16, 17, -17, 31, -31, 32, -32, 33, -33, 64, -64, 127, -127, -128};
+    Runner runner{instruction};
+    Mismatches mismatches;
+    std::mt19937_64 rng(7);
+    for (size_t iteration = 0; iteration < 4000; iteration++) {
+        std::array<T, lanes> a{}, b{}, expected{};
+        for (size_t j = 0; j < lanes; j++) {
+            a[j] = T(rng());
+            if (iteration % 3 == 0) {
+                a[j] = T(j % 2 ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max());
+            }
+            const u8 shift = iteration % 2 ? u8(edge_shifts[rng() % edge_shifts.size()]) : u8(rng());
+            // Only the low byte of each element is the shift amount
+            b[j] = T((T(rng()) & ~T(0xFF)) | T(shift));
+            if (j < active) {
+                expected[j] = ReferenceShift<T>(a[j], shift);
+            }
+        }
+        Vector va, vb, ve;
+        std::memcpy(&va, a.data(), 16);
+        std::memcpy(&vb, b.data(), 16);
+        std::memcpy(&ve, expected.data(), 16);
+        runner.Run(0, va, vb);
+        if (runner.V0() != ve) {
+            mismatches.Report(std::string(name) + " a=" + Hex(va[1]) + Hex(va[0]) + " b=" + Hex(vb[1]) + Hex(vb[0]) + " got=" + Hex(runner.V0()[1]) + Hex(runner.V0()[0]) + " expected=" + Hex(ve[1]) + Hex(ve[0]));
+        }
+    }
+}
+
+}  // namespace
+
+TEST_CASE("A64: SSHL/USHL 8/16-bit", "[a64][fp_inline]") {
+    CheckShift<s8>(0x4E224420, "SSHL V0.16B, V1.16B, V2.16B", true);
+    CheckShift<s16>(0x4E624420, "SSHL V0.8H, V1.8H, V2.8H", true);
+    CheckShift<u8>(0x6E224420, "USHL V0.16B, V1.16B, V2.16B", true);
+    CheckShift<u16>(0x6E624420, "USHL V0.8H, V1.8H, V2.8H", true);
+    CheckShift<s8>(0x0E224420, "SSHL V0.8B, V1.8B, V2.8B", false);
+    CheckShift<u16>(0x2E624420, "USHL V0.4H, V1.4H, V2.4H", false);
+}
+

@@ -549,7 +549,77 @@ template<typename T> constexpr T VShift(T x, T y) {
     return T(unsigned_type(x) << unsigned_type(shift_amount));
 }
 
+// SSHL/USHL on 8/16-bit elements: widen to 32-bit elements and use the AVX2 variable dword shifts.
+// The shift is the signed low byte of each element; negative shifts right and |shift| >= esize gives 0 or sign fill.
+static void EmitVShiftNarrowAVX2(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, size_t esize, bool is_signed) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto const a = ctx.reg_alloc.UseScratchXmm(code, args[0]);
+    auto const b = ctx.reg_alloc.UseScratchXmm(code, args[1]);
+    auto const t0 = ctx.reg_alloc.ScratchXmm(code);
+    auto const t1 = ctx.reg_alloc.ScratchXmm(code);
+
+    const auto widen = [&](const Xbyak::Ymm& dst, const Xbyak::Xmm& src) {
+        if (esize == 8) {
+            is_signed ? code.vpmovsxbd(dst, src) : code.vpmovzxbd(dst, src);
+        } else {
+            is_signed ? code.vpmovsxwd(dst, src) : code.vpmovzxwd(dst, src);
+        }
+    };
+    // value = shift(value, shift amount); clobbers abs and left
+    const auto shift = [&](const Xbyak::Ymm& value, const Xbyak::Ymm& amount, const Xbyak::Ymm& abs, const Xbyak::Ymm& left) {
+        code.vpabsd(abs, amount);
+        code.vpsllvd(left, value, abs);
+        is_signed ? code.vpsravd(value, value, abs) : code.vpsrlvd(value, value, abs);
+        code.vblendvps(value, left, value, amount);
+    };
+
+    if (esize == 16) {
+        code.vpsllw(b, b, 8);
+        code.vpsraw(b, b, 8);
+        code.vpmovsxwd(b.cvt256(), b);
+        widen(a.cvt256(), a);
+        shift(a.cvt256(), b.cvt256(), t0.cvt256(), t1.cvt256());
+        code.vpxor(t0, t0, t0);
+        code.vpblendw(a.cvt256(), a.cvt256(), t0.cvt256(), 0b10101010);
+        code.vextracti128(t0, a.cvt256(), 1);
+        code.vpackusdw(a, a, t0);
+        code.vzeroupper();
+        ctx.reg_alloc.DefineValue(code, inst, a);
+        return;
+    }
+
+    ASSERT(esize == 8);
+    auto const t2 = ctx.reg_alloc.ScratchXmm(code);
+    auto const t3 = ctx.reg_alloc.ScratchXmm(code);
+    // Elements 8-15 into the low half of t0/t1
+    code.vpshufd(t0, a, 0b11101110);
+    code.vpshufd(t1, b, 0b11101110);
+    // Elements 0-7 -> t2
+    widen(t2.cvt256(), a);
+    code.vpmovsxbd(t3.cvt256(), b);
+    shift(t2.cvt256(), t3.cvt256(), a.cvt256(), b.cvt256());
+    // Elements 8-15 -> a
+    widen(a.cvt256(), t0);
+    code.vpmovsxbd(t3.cvt256(), t1);
+    shift(a.cvt256(), t3.cvt256(), b.cvt256(), t1.cvt256());
+    // Truncate to bytes and restore the element order after the in-lane packs
+    code.vpcmpeqd(t3.cvt256(), t3.cvt256(), t3.cvt256());
+    code.vpsrld(t3.cvt256(), t3.cvt256(), 24);
+    code.vpand(t2.cvt256(), t2.cvt256(), t3.cvt256());
+    code.vpand(a.cvt256(), a.cvt256(), t3.cvt256());
+    code.vpackusdw(t2.cvt256(), t2.cvt256(), a.cvt256());
+    code.vpermq(t2.cvt256(), t2.cvt256(), 0b11011000);
+    code.vextracti128(t0, t2.cvt256(), 1);
+    code.vpackuswb(t2, t2, t0);
+    code.vzeroupper();
+    ctx.reg_alloc.DefineValue(code, inst, t2);
+}
+
 void EmitX64::EmitVectorArithmeticVShift8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVShiftNarrowAVX2(code, ctx, inst, 8, true);
+        return;
+    }
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s8>& result, const VectorArray<s8>& a, const VectorArray<s8>& b) {
         std::transform(a.begin(), a.end(), b.begin(), result.begin(), VShift<s8>);
     });
@@ -574,6 +644,8 @@ void EmitX64::EmitVectorArithmeticVShift16(EmitContext& ctx, IR::Inst* inst) {
         code.vpsllvw(result, result, left_shift);
         code.vpblendmb(result | k1, result, tmp);
         ctx.reg_alloc.DefineValue(code, inst, result);
+    } else if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVShiftNarrowAVX2(code, ctx, inst, 16, true);
     } else {
         EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s16>& result, const VectorArray<s16>& a, const VectorArray<s16>& b) {
             std::transform(a.begin(), a.end(), b.begin(), result.begin(), VShift<s16>);
@@ -1800,6 +1872,8 @@ void EmitX64::EmitVectorLogicalVShift8(EmitContext& ctx, IR::Inst* inst) {
         code.vgf2p8affineqb(result | negative_mask, result, xmm0, 0);
 
         ctx.reg_alloc.DefineValue(code, inst, result);
+    } else if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVShiftNarrowAVX2(code, ctx, inst, 8, false);
     } else {
         EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<u8>& result, const VectorArray<u8>& a, const VectorArray<u8>& b) {
             std::transform(a.begin(), a.end(), b.begin(), result.begin(), VShift<u8>);
@@ -1827,6 +1901,8 @@ void EmitX64::EmitVectorLogicalVShift16(EmitContext& ctx, IR::Inst* inst) {
         code.vpord(result, result, tmp);
 
         ctx.reg_alloc.DefineValue(code, inst, result);
+    } else if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVShiftNarrowAVX2(code, ctx, inst, 16, false);
     } else {
         EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<u16>& result, const VectorArray<u16>& a, const VectorArray<u16>& b) {
             std::transform(a.begin(), a.end(), b.begin(), result.begin(), VShift<u16>);
