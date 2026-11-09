@@ -7,6 +7,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/tests/A64/testenv.h"
@@ -2855,4 +2856,141 @@ TEST_CASE("A64: Rounding", "[a64]") {
     CHECK(jit.GetVector(4) == Vector{0x4000000040000000, 0x4000000040000000});
     CHECK(jit.GetVector(5) == Vector{0x4000000040000000, 0x4000000040000000});
     CHECK(jit.GetVector(6) == Vector{0x4000000040000000, 0x4000000040000000});
+}
+
+TEST_CASE("A64: Nested BL/RET deeper than the RSB", "[a64]") {
+    // Also cover the RSB miss path without fast dispatch
+    const OptimizationFlag optimizations = GENERATE(all_safe_optimizations, all_safe_optimizations & ~OptimizationFlag::FastDispatch);
+
+    A64TestEnv env;
+    A64::UserConfig jit_user_config{};
+    jit_user_config.callbacks = &env;
+    jit_user_config.optimizations = optimizations;
+    A64::Jit jit{jit_user_config};
+
+    // f(n): if n != 0 { f(n - 1); x4 += n; x3 += 1; }
+    env.code_mem.emplace_back(0x94000002);  // 00: BL f
+    env.code_mem.emplace_back(0x14000000);  // 04: B .
+    env.code_mem.emplace_back(0xa9bf7be0);  // 08: f: STP X0, X30, [SP, #-16]!
+    env.code_mem.emplace_back(0xb40000c0);  // 0c: CBZ X0, out
+    env.code_mem.emplace_back(0xd1000400);  // 10: SUB X0, X0, #1
+    env.code_mem.emplace_back(0x97fffffd);  // 14: BL f
+    env.code_mem.emplace_back(0xf94003e0);  // 18: LDR X0, [SP]
+    env.code_mem.emplace_back(0x8b000084);  // 1c: ADD X4, X4, X0
+    env.code_mem.emplace_back(0x91000463);  // 20: ADD X3, X3, #1
+    env.code_mem.emplace_back(0xa8c17be0);  // 24: out: LDP X0, X30, [SP], #16
+    env.code_mem.emplace_back(0xd65f03c0);  // 28: RET
+
+    // Run each depth twice so the second pass uses blocks and RSB entries left by the first
+    for (const u64 depth : {7, 8, 9, 15, 16, 17, 33, 7, 8, 9, 15, 16, 17, 33}) {
+        jit.SetRegister(0, depth);
+        jit.SetRegister(3, 0);
+        jit.SetRegister(4, 0);
+        jit.SetRegister(30, 0);
+        jit.SetSP(0x100000);
+        jit.SetPC(0);
+
+        env.ticks_left = 1000;
+        CheckedRun([&]() { jit.Run(); });
+
+        REQUIRE(jit.GetRegister(0) == depth);
+        REQUIRE(jit.GetRegister(3) == depth);
+        REQUIRE(jit.GetRegister(4) == depth * (depth + 1) / 2);
+        REQUIRE(jit.GetRegister(30) == 4);
+        REQUIRE(jit.GetSP() == 0x100000);
+        REQUIRE(jit.GetPC() == 4);
+    }
+}
+
+TEST_CASE("A64: Indirect BR/BLR loop", "[a64]") {
+    // Also cover the RSB miss path without fast dispatch
+    const OptimizationFlag optimizations = GENERATE(all_safe_optimizations, all_safe_optimizations & ~OptimizationFlag::FastDispatch);
+
+    A64TestEnv env;
+    A64::UserConfig jit_user_config{};
+    jit_user_config.callbacks = &env;
+    jit_user_config.optimizations = optimizations;
+    A64::Jit jit{jit_user_config};
+
+    env.code_mem.emplace_back(0x10000205);  // 00: ADR X5, func
+    env.code_mem.emplace_back(0x100000ea);  // 04: ADR X10, targets
+    env.code_mem.emplace_back(0xd63f00a0);  // 08: loop: BLR X5
+    env.code_mem.emplace_back(0x924004cb);  // 0c: AND X11, X6, #3
+    env.code_mem.emplace_back(0x8b0b0d4c);  // 10: ADD X12, X10, X11, LSL #3
+    env.code_mem.emplace_back(0xd61f0180);  // 14: BR X12
+    env.code_mem.emplace_back(0x14000000);  // 18: B .
+    env.code_mem.emplace_back(0x14000000);  // 1c: B .
+    env.code_mem.emplace_back(0x91000694);  // 20: targets: ADD X20, X20, #1
+    env.code_mem.emplace_back(0x14000009);  // 24: B cont
+    env.code_mem.emplace_back(0x910006b5);  // 28: ADD X21, X21, #1
+    env.code_mem.emplace_back(0x14000007);  // 2c: B cont
+    env.code_mem.emplace_back(0x910006d6);  // 30: ADD X22, X22, #1
+    env.code_mem.emplace_back(0x14000005);  // 34: B cont
+    env.code_mem.emplace_back(0x910006f7);  // 38: ADD X23, X23, #1
+    env.code_mem.emplace_back(0x14000003);  // 3c: B cont
+    env.code_mem.emplace_back(0x91000421);  // 40: func: ADD X1, X1, #1
+    env.code_mem.emplace_back(0xd65f03c0);  // 44: RET
+    env.code_mem.emplace_back(0xf10004c6);  // 48: cont: SUBS X6, X6, #1
+    env.code_mem.emplace_back(0x54fffde1);  // 4c: B.NE loop
+    env.code_mem.emplace_back(0x14000000);  // 50: B .
+
+    jit.SetRegister(6, 50);
+    jit.SetPC(0);
+
+    env.ticks_left = 1000;
+    CheckedRun([&]() { jit.Run(); });
+
+    REQUIRE(jit.GetRegister(1) == 50);
+    REQUIRE(jit.GetRegister(6) == 0);
+    REQUIRE(jit.GetRegister(20) == 12);
+    REQUIRE(jit.GetRegister(21) == 13);
+    REQUIRE(jit.GetRegister(22) == 13);
+    REQUIRE(jit.GetRegister(23) == 12);
+    REQUIRE(jit.GetRegister(30) == 0xc);
+    REQUIRE(jit.GetPC() == 0x50);
+}
+
+namespace {
+struct A64HintTestEnv final : A64TestEnv {
+    std::vector<A64::Exception> exceptions;
+    void ExceptionRaised(u64, A64::Exception exception) override {
+        exceptions.push_back(exception);
+    }
+};
+}  // namespace
+
+TEST_CASE("A64: Hint instructions", "[a64]") {
+    const bool hook_hint_instructions = GENERATE(false, true);
+
+    A64HintTestEnv env;
+    A64::UserConfig jit_user_config{};
+    jit_user_config.callbacks = &env;
+    jit_user_config.hook_hint_instructions = hook_hint_instructions;
+    A64::Jit jit{jit_user_config};
+
+    env.code_mem.emplace_back(0x91000400);  // 00: ADD X0, X0, #1
+    env.code_mem.emplace_back(0xd503203f);  // 04: YIELD
+    env.code_mem.emplace_back(0xd503205f);  // 08: WFE
+    env.code_mem.emplace_back(0x91000800);  // 0c: ADD X0, X0, #2
+    env.code_mem.emplace_back(0xd503209f);  // 10: SEV
+    env.code_mem.emplace_back(0xd50320bf);  // 14: SEVL
+    env.code_mem.emplace_back(0xd503207f);  // 18: WFI
+    env.code_mem.emplace_back(0x8b000001);  // 1c: ADD X1, X0, X0
+    env.code_mem.emplace_back(0x14000000);  // 20: B .
+
+    jit.SetPC(0);
+
+    env.ticks_left = env.code_mem.size();
+    CheckedRun([&]() { jit.Run(); });
+
+    REQUIRE(jit.GetRegister(0) == 3);
+    REQUIRE(jit.GetRegister(1) == 6);
+    REQUIRE(jit.GetPC() == 0x20);
+    if (hook_hint_instructions) {
+        REQUIRE(env.exceptions == std::vector<A64::Exception>{
+            A64::Exception::Yield, A64::Exception::WaitForEvent, A64::Exception::SendEvent,
+            A64::Exception::SendEventLocal, A64::Exception::WaitForInterrupt});
+    } else {
+        REQUIRE(env.exceptions.empty());
+    }
 }

@@ -400,6 +400,12 @@ HostLoc RegAlloc::SelectARegister(std::bitset<32> desired_locations) const noexc
     // to later track this down - however I just modified the LRU algo so it prefers empty registers first
     // we need to test high register pressure (and spills, maybe 32 regs?)
     static_assert(size_t(HostLoc::FirstSpill) >= 32);
+#ifdef _WIN32
+    // Blocks don't set up a frame pointer on Windows and RunCode saves %rbp as callee-saved
+    constexpr bool allocate_rbp = true;
+#else
+    constexpr bool allocate_rbp = false;
+#endif
     // Selects the best location out of the available locations.
     // NOTE: Using last is BAD because new REX prefix for each insn using the last regs
     // TODO: Actually do LRU or something. Currently we just try to pick something without a value if possible.
@@ -417,8 +423,8 @@ HostLoc RegAlloc::SelectARegister(std::bitset<32> desired_locations) const noexc
             // While R13 and R14 are technically available, we avoid allocating for them
             // at all costs, because theoretically skipping them is better than spilling
             // all over the place - i also fixes bugs with high reg pressure
-            // %rbp must not be trashed, so skip it as well
-            } else if (i == HostLoc::RBP || (i >= HostLoc::R13 && i <= HostLoc::R15)) {
+            // %rbp is the frame pointer for perf unwinding outside Windows, so skip it as well
+            } else if ((i >= HostLoc::R13 && i <= HostLoc::R15) || (!allocate_rbp && i == HostLoc::RBP)) {
                 // skip, do not touch
             // Intel recommends to reuse registers as soon as they're overwritable (DO NOT SPILL)
             } else if (loc_info.IsEmpty()) {
